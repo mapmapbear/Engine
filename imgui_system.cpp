@@ -294,6 +294,9 @@ void ImGuiSystem::NewFrame()
 		}
 	}
 
+	// Main UI Window
+	ImGui::Begin("MainUI");
+
 	// Ball Debugging Controls
 	ImGui::Separator();
 	ImGui::Text("Ball Debugging Controls:");
