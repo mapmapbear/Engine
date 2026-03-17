@@ -478,4 +478,4 @@ vk::Result Renderer::waitForFencesSafe(const std::vector<vk::Fence> &fences, vk:
 vk::Result Renderer::waitForFencesSafe(vk::Fence fence, vk::Bool32 waitAll, uint64_t timeoutNs)
 {
 	return waitForFencesSafe(std::vector<vk::Fence>{fence}, waitAll, timeoutNs);
-}
+} 

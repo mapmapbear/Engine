@@ -49,6 +49,9 @@ struct UniformBufferObject {
     float farZ;
     float slicesZ;
     float _pad3;
+    float4x4 cascadeLightSpaceMatrices[3];
+    float4 cascadeSplitDepths;
+    float4 cascadeTransitionData;
     // Planar reflections
     float4x4 reflectionVP;   // projection * mirroredView
     int reflectionEnabled;   // 1 when sampling reflection in main pass

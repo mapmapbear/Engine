@@ -20,6 +20,14 @@
 import common_types;
 import pbr_utils;
 
+static const uint CSM_CASCADE_COUNT = 3u;
+
+struct CascadeBlendSelection {
+    uint cascadeIndex;
+    uint nextCascadeIndex;
+    float blendWeight;
+};
+
 // Result of evaluating a single light
 struct LightEvaluation {
     float3 L;          // Direction to light (normalized)
@@ -84,6 +92,49 @@ LightEvaluation evaluateLight(LightData light, float3 worldPos, float3 N) {
     }
     
     return result;
+}
+
+CascadeBlendSelection selectCascadeByDepth(float viewDepth, float4 cascadeSplitDepths, float4 cascadeTransitionData) {
+    CascadeBlendSelection selection;
+    selection.cascadeIndex = CSM_CASCADE_COUNT - 1u;
+    selection.nextCascadeIndex = selection.cascadeIndex;
+    selection.blendWeight = 0.0;
+
+    float split0 = cascadeSplitDepths.x;
+    float split1 = cascadeSplitDepths.y;
+    float split2 = cascadeSplitDepths.z;
+
+    if (viewDepth <= split0) {
+        selection.cascadeIndex = 0u;
+        selection.nextCascadeIndex = 0u;
+    } else if (viewDepth <= split1) {
+        selection.cascadeIndex = 1u;
+        selection.nextCascadeIndex = 1u;
+    } else if (viewDepth <= split2) {
+        selection.cascadeIndex = 2u;
+        selection.nextCascadeIndex = 2u;
+    }
+
+    if (selection.cascadeIndex < CSM_CASCADE_COUNT - 1u) {
+        float splitDepth = (selection.cascadeIndex == 0u) ? split0 : split1;
+        float prevSplit = (selection.cascadeIndex == 0u) ? cascadeTransitionData.z : ((selection.cascadeIndex == 1u) ? split0 : split1);
+        float transitionFraction = saturate(cascadeTransitionData.x);
+        float transitionWidth = max((splitDepth - prevSplit) * transitionFraction, 1e-4);
+        float transitionStart = splitDepth - transitionWidth;
+
+        if (viewDepth > transitionStart) {
+            selection.nextCascadeIndex = min(selection.cascadeIndex + 1u, CSM_CASCADE_COUNT - 1u);
+            selection.blendWeight = saturate((viewDepth - transitionStart) / transitionWidth);
+        }
+    }
+
+    return selection;
+}
+
+float computeCascadeShadowBias(float3 N, float3 L, float baseBias) {
+    float NdotL = saturate(dot(N, L));
+    float slopeScale = 1.0 - NdotL;
+    return max(baseBias, baseBias * (1.0 + slopeScale * 2.0));
 }
 
 // Accumulate lighting contribution from a single light using GGX BRDF

@@ -17,6 +17,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -133,6 +134,9 @@ struct UniformBufferObject
 	alignas(4) float farZ;
 	alignas(4) float slicesZ;
 	alignas(4) float _uboPad3;
+	alignas(16) glm::mat4 cascadeLightSpaceMatrices[3];
+	alignas(16) glm::vec4 cascadeSplitDepths;
+	alignas(16) glm::vec4 cascadeTransitionData;
 	// Planar reflections
 	alignas(16) glm::mat4 reflectionVP;        // projection * mirroredView
 	alignas(4) int reflectionEnabled;          // 1 when sampling reflection in main pass
@@ -247,6 +251,7 @@ struct MaterialProperties
 enum class RenderMode
 {
 	Rasterization,        // Traditional rasterization pipeline
+	Deferred,
 	RayQuery              // Ray query compute shader
 };
 
@@ -804,8 +809,18 @@ class Renderer
 		return reflectionIntensity;
 	}
 
-	void SetPlanarReflectionsEnabled(bool enabled);
-	void TogglePlanarReflections();
+	void SetPlanarReflectionsEnabled(bool enabled)
+	{
+		// Flip mode and mark resources dirty so RTs are created/destroyed at the next safe point
+		enablePlanarReflections = enabled;
+		reflectionResourcesDirty = true;
+	}
+
+	void TogglePlanarReflections()
+	{
+		SetPlanarReflectionsEnabled(!enablePlanarReflections);
+	}
+
 	bool IsPlanarReflectionsEnabled() const
 	{
 		return enablePlanarReflections;
@@ -822,7 +837,96 @@ class Renderer
 	}
 	void ToggleRenderMode()
 	{
-		currentRenderMode = (currentRenderMode == RenderMode::Rasterization) ? RenderMode::RayQuery : RenderMode::Rasterization;
+		switch (currentRenderMode)
+		{
+			case RenderMode::Rasterization:
+				currentRenderMode = RenderMode::Deferred;
+				break;
+			case RenderMode::Deferred:
+				currentRenderMode = RenderMode::RayQuery;
+				break;
+			case RenderMode::RayQuery:
+			default:
+				currentRenderMode = RenderMode::Rasterization;
+				break;
+		}
+	}
+
+	bool IsTAAEnabled() const
+	{
+		return taaJitterEnabled;
+	}
+	void SetTAAEnabled(bool enabled)
+	{
+		if (taaJitterEnabled == enabled)
+		{
+			return;
+		}
+		taaJitterEnabled = enabled;
+		taaHistoryValid  = false;
+	}
+
+	bool IsSAOEnabled() const
+	{
+		return enableSAO;
+	}
+	void SetSAOEnabled(bool enabled)
+	{
+		if (enableSAO == enabled)
+		{
+			return;
+		}
+		enableSAO      = enabled;
+		saoHistoryValid = false;
+	}
+
+	bool IsVolumetricScatteringEnabled() const
+	{
+		return enableVolumetricScattering;
+	}
+	void SetVolumetricScatteringEnabled(bool enabled)
+	{
+		if (enableVolumetricScattering == enabled)
+		{
+			return;
+		}
+		enableVolumetricScattering = enabled;
+		volumetricHistoryValid     = false;
+	}
+
+	bool IsCascadedShadowMapsEnabled() const
+	{
+		return enableCascadedShadowMaps;
+	}
+	void SetCascadedShadowMapsEnabled(bool enabled)
+	{
+		if (enableCascadedShadowMaps == enabled)
+		{
+			return;
+		}
+		enableCascadedShadowMaps = enabled;
+		csmDataValid             = false;
+		csmResourcesDirty        = true;
+	}
+
+	float GetCSMSplitLambda() const
+	{
+		return csmSplitLambda;
+	}
+	void SetCSMSplitLambda(float lambda)
+	{
+		csmSplitLambda = std::clamp(lambda, 0.0f, 1.0f);
+		csmDataValid   = false;
+	}
+
+	float GetCSMTransitionBlendFraction() const
+	{
+		return csmTransitionBlendFraction;
+	}
+	void SetCSMTransitionBlendFraction(float blendFraction)
+	{
+		csmTransitionBlendFraction = std::clamp(blendFraction, 0.01f, 0.49f);
+		csmDataValid               = false;
 	}
 
 	// Ray query capability getters
@@ -1191,6 +1295,172 @@ class Renderer
 	vk::raii::PipelineLayout      forwardPlusPipelineLayout      = nullptr;
 	vk::raii::Pipeline            forwardPlusPipeline            = nullptr;
 	vk::raii::DescriptorSetLayout forwardPlusDescriptorSetLayout = nullptr;
+	vk::raii::PipelineLayout      deferredGBufferPipelineLayout      = nullptr;
+	vk::raii::Pipeline            deferredGBufferPipeline            = nullptr;
+	vk::raii::DescriptorSetLayout deferredGBufferDescriptorSetLayout = nullptr;
+	vk::raii::PipelineLayout      deferredLightingPipelineLayout      = nullptr;
+	vk::raii::Pipeline            deferredLightingPipeline            = nullptr;
+	vk::raii::DescriptorSetLayout deferredLightingDescriptorSetLayout = nullptr;
+	std::vector<vk::raii::DescriptorSet> deferredLightingDescriptorSets;
+
+	struct DepthPyramidDispatchStep
+	{
+		vk::Extent2D srcExtent{0, 0};
+		vk::Extent2D dstExtent{0, 0};
+	};
+
+	vk::raii::Image                         depthPyramidImage               = nullptr;
+	std::unique_ptr<MemoryPool::Allocation> depthPyramidImageAllocation     = nullptr;
+	vk::raii::ImageView                     depthPyramidFullView            = nullptr;
+	std::vector<vk::raii::ImageView>        depthPyramidMipViews;
+	std::vector<vk::ImageLayout>            depthPyramidMipLayouts;
+	std::vector<DepthPyramidDispatchStep>   depthPyramidDispatchSteps;
+	std::vector<vk::raii::DescriptorSet>    depthPyramidDescriptorSets;
+	uint32_t                                depthPyramidMipCount            = 0;
+	bool                                    depthPyramidHistoryValid        = false;
+	vk::Format                              depthPyramidFormat              = vk::Format::eR32Sfloat;
+	vk::raii::Sampler                       depthPyramidSampler             = nullptr;
+	vk::raii::PipelineLayout                depthPyramidPipelineLayout      = nullptr;
+	vk::raii::Pipeline                      depthPyramidPipeline            = nullptr;
+	vk::raii::DescriptorSetLayout           depthPyramidDescriptorSetLayout = nullptr;
+
+	struct SAOPushConstants
+	{
+		alignas(8) glm::vec2 invResolution{0.0f};
+		alignas(4) float radiusPixels = 2.25f;
+		alignas(4) float intensity    = 0.35f;
+		alignas(4) float bias         = 0.0015f;
+		alignas(4) float contrast     = 1.1f;
+		alignas(4) float mipBias      = 1.0f;
+		alignas(8) glm::vec2 _pad{0.0f};
+	};
+
+	struct VolumetricPushConstants
+	{
+		alignas(8) glm::vec2 invResolution{0.0f};
+		alignas(4) float scatteringStrength = 0.035f;
+		alignas(4) float extinction = 0.09f;
+		alignas(4) float anisotropy = 0.35f;
+		alignas(4) float heightFogDensity = 0.018f;
+		alignas(4) float maxDistance = 80.0f;
+		alignas(4) float maxIntensity = 0.25f;
+		alignas(4) uint32_t lightCount = 0;
+		alignas(4) uint32_t stepCount = 8;
+	};
+
+	struct CompositePushConstants
+	{
+		alignas(4) float exposure = 1.0f;
+		alignas(4) float gamma = 2.2f;
+		alignas(4) int32_t outputIsSRGB = 0;
+		alignas(4) int32_t enableTAA = 0;
+		alignas(4) int32_t taaHistoryValid = 0;
+		alignas(4) int32_t enableSAO = 0;
+		alignas(4) int32_t saoValid = 0;
+		alignas(4) int32_t enableVolumetric = 0;
+		alignas(4) int32_t volumetricValid = 0;
+		alignas(4) float taaFeedback = 0.1f;
+		alignas(4) float _pad0 = 0.0f;
+		alignas(4) float _pad1 = 0.0f;
+	};
+
+	bool             enableSAO = true;
+	SAOPushConstants saoSettings{};
+	std::vector<vk::raii::Image>                         saoImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> saoImageAllocations;
+	std::vector<vk::raii::ImageView>                     saoImageViews;
+	std::vector<vk::ImageLayout>                         saoImageLayouts;
+	std::vector<vk::raii::DescriptorSet>                 saoDescriptorSets;
+	vk::raii::Sampler                                    saoSampler                   = nullptr;
+	vk::raii::PipelineLayout                             saoPipelineLayout            = nullptr;
+	vk::raii::Pipeline                                   saoPipeline                  = nullptr;
+	vk::raii::DescriptorSetLayout                        saoDescriptorSetLayout       = nullptr;
+	bool                                                 saoHistoryValid              = false;
+
+	bool                    enableVolumetricScattering = true;
+	VolumetricPushConstants volumetricSettings{};
+	std::vector<vk::raii::Image>                         volumetricImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> volumetricImageAllocations;
+	std::vector<vk::raii::ImageView>                     volumetricImageViews;
+	std::vector<vk::ImageLayout>                         volumetricImageLayouts;
+	std::vector<vk::raii::DescriptorSet>                 volumetricDescriptorSets;
+	vk::raii::Sampler                                    volumetricSampler            = nullptr;
+	vk::raii::PipelineLayout                             volumetricPipelineLayout     = nullptr;
+	vk::raii::Pipeline                                   volumetricPipeline           = nullptr;
+	vk::raii::DescriptorSetLayout                        volumetricDescriptorSetLayout = nullptr;
+	bool                                                 volumetricHistoryValid       = false;
+
+	struct FrustumCullAABB
+	{
+		alignas(16) glm::vec4 minBounds{0.0f};
+		alignas(16) glm::vec4 maxBounds{0.0f};
+	};
+
+	struct FrustumCullParams
+	{
+		alignas(16) glm::vec4 frustumPlanes[6]{};
+		uint32_t              instanceCount = 0;
+		uint32_t              _pad0         = 0;
+		uint32_t              _pad1         = 0;
+		uint32_t              _pad2         = 0;
+	};
+
+	struct OcclusionCullParams
+	{
+		alignas(16) glm::mat4 clipFromWorld{1.0f};
+		alignas(16) glm::vec4 depthPyramidInfo{0.0f};
+		alignas(16) glm::vec4 safetyInfo{0.0f};
+	};
+
+	struct FrustumCullPerFrame
+	{
+		vk::raii::Buffer                        instanceAabbBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> instanceAabbBufferAllocation = nullptr;
+		void                                   *instanceAabbMapped           = nullptr;
+		size_t                                  instanceCapacity             = 0;
+
+		vk::raii::Buffer                        visibleIndicesBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> visibleIndicesBufferAllocation = nullptr;
+		void                                   *visibleIndicesMapped           = nullptr;
+		size_t                                  visibleIndicesCapacity         = 0;
+
+		vk::raii::Buffer                        visibleCountBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> visibleCountBufferAllocation = nullptr;
+		void                                   *visibleCountMapped           = nullptr;
+
+		vk::raii::Buffer                        occlusionVisibleIndicesBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> occlusionVisibleIndicesBufferAllocation = nullptr;
+		void                                   *occlusionVisibleIndicesMapped           = nullptr;
+		size_t                                  occlusionVisibleIndicesCapacity         = 0;
+
+		vk::raii::Buffer                        occlusionVisibleCountBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> occlusionVisibleCountBufferAllocation = nullptr;
+		void                                   *occlusionVisibleCountMapped           = nullptr;
+
+		vk::raii::Buffer                        paramsBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> paramsBufferAllocation = nullptr;
+		void                                   *paramsMapped           = nullptr;
+
+		vk::raii::Buffer                        occlusionParamsBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> occlusionParamsBufferAllocation = nullptr;
+		void                                   *occlusionParamsMapped           = nullptr;
+
+		vk::raii::Buffer                        indirectCommandsBuffer           = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> indirectCommandsBufferAllocation = nullptr;
+		void                                   *indirectCommandsMapped           = nullptr;
+		size_t                                  indirectCommandCapacity          = 0;
+
+		vk::raii::DescriptorSet computeSet = nullptr;
+		vk::raii::DescriptorSet occlusionComputeSet = nullptr;
+	};
+
+	std::vector<FrustumCullPerFrame> frustumCullPerFrame;
+	vk::raii::PipelineLayout         frustumCullPipelineLayout      = nullptr;
+	vk::raii::Pipeline               frustumCullPipeline            = nullptr;
+	vk::raii::DescriptorSetLayout    frustumCullDescriptorSetLayout = nullptr;
+	vk::raii::PipelineLayout         occlusionCullPipelineLayout      = nullptr;
+	vk::raii::Pipeline               occlusionCullPipeline            = nullptr;
+	vk::raii::DescriptorSetLayout    occlusionCullDescriptorSetLayout = nullptr;
 
 	// Depth pre-pass pipeline
 	vk::raii::Pipeline depthPrepassPipeline = nullptr;
@@ -1385,6 +1655,48 @@ class Renderer
 	// Track the current layout per frame (initialized to eUndefined at creation)
 	std::vector<vk::ImageLayout> opaqueSceneColorImageLayouts;
 	vk::raii::Sampler            opaqueSceneColorSampler{nullptr};
+	std::vector<vk::raii::Image>                         gBufferAlbedoImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> gBufferAlbedoImageAllocations;
+	std::vector<vk::raii::ImageView>                     gBufferAlbedoImageViews;
+	std::vector<vk::ImageLayout>                         gBufferAlbedoImageLayouts;
+	std::vector<vk::raii::Image>                         gBufferNormalImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> gBufferNormalImageAllocations;
+	std::vector<vk::raii::ImageView>                     gBufferNormalImageViews;
+	std::vector<vk::ImageLayout>                         gBufferNormalImageLayouts;
+	std::vector<vk::raii::Image>                         gBufferMaterialImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> gBufferMaterialImageAllocations;
+	std::vector<vk::raii::ImageView>                     gBufferMaterialImageViews;
+	std::vector<vk::ImageLayout>                         gBufferMaterialImageLayouts;
+	std::vector<vk::raii::Image>                         gBufferEmissiveImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> gBufferEmissiveImageAllocations;
+	std::vector<vk::raii::ImageView>                     gBufferEmissiveImageViews;
+	std::vector<vk::ImageLayout>                         gBufferEmissiveImageLayouts;
+	vk::Format                                           gBufferAlbedoFormat   = vk::Format::eR8G8B8A8Unorm;
+	vk::Format                                           gBufferNormalFormat   = vk::Format::eA2B10G10R10UnormPack32;
+	vk::Format                                           gBufferMaterialFormat = vk::Format::eR8G8B8A8Unorm;
+	vk::Format                                           gBufferEmissiveFormat = vk::Format::eR16G16B16A16Sfloat;
+
+	std::vector<vk::raii::Image>                         deferredLightingImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> deferredLightingImageAllocations;
+	std::vector<vk::raii::ImageView>                     deferredLightingImageViews;
+	std::vector<vk::ImageLayout>                         deferredLightingImageLayouts;
+	vk::raii::Sampler                                    deferredLightingSampler{nullptr};
+	vk::Format                                           deferredLightingFormat = vk::Format::eR16G16B16A16Sfloat;
+
+	std::vector<vk::raii::Image>                         taaHistoryImages;
+	std::vector<std::unique_ptr<MemoryPool::Allocation>> taaHistoryImageAllocations;
+	std::vector<vk::raii::ImageView>                     taaHistoryImageViews;
+	std::vector<vk::ImageLayout>                         taaHistoryImageLayouts;
+	vk::raii::Sampler                                    taaHistorySampler{nullptr};
+	bool                                                 taaHistoryValid{false};
+	bool                                                 taaJitterEnabled{false};
+	uint32_t                                             taaFrameIndex{0};
+	uint32_t                                             taaHistoryReadIndex{0};
+	uint32_t                                             taaHistoryWriteIndex{0};
+	glm::vec2                                            taaCurrentJitterPixels{0.0f};
+	glm::vec2                                            taaPreviousJitterPixels{0.0f};
+	glm::vec2                                            taaCurrentJitterNdc{0.0f};
+	glm::vec2                                            taaPreviousJitterNdc{0.0f};
 
 	// A descriptor set for the opaque scene color texture. One per frame in flight.
 	std::vector<vk::raii::DescriptorSet> transparentDescriptorSets;
@@ -1726,9 +2038,73 @@ class Renderer
 
 	// --- Performance & diagnostics ---
 	UniformBufferObject frameUboTemplate{};
+	static constexpr uint32_t CSM_CASCADE_COUNT = 3u;
+	enum class GpuProfilePass : uint32_t
+	{
+		FrustumCull = 0,
+		RayQuery,
+		DepthPrepass,
+		DepthPyramid,
+		SAO,
+		Volumetric,
+		ForwardPlus,
+		Opaque,
+		TAAHistory,
+		Composite,
+		Transparent,
+		ImGui,
+		Count
+	};
+	static constexpr size_t GPU_PROFILE_PASS_COUNT = static_cast<size_t>(GpuProfilePass::Count);
+
+	struct GpuProfilingFrameStats
+	{
+		std::array<double, GPU_PROFILE_PASS_COUNT> passMs{};
+		std::array<uint8_t, GPU_PROFILE_PASS_COUNT> passValid{};
+		double                                     totalMs    = 0.0;
+		bool                                       totalValid = false;
+	};
+
+	bool                            gpuProfilingSupported = false;
+	bool                            gpuProfilingEnabled   = false;
+	float                           gpuTimestampPeriodNs  = 0.0f;
+	std::vector<vk::raii::QueryPool> gpuProfilingQueryPools;
+	std::vector<uint8_t>             gpuProfilingQueriesPending;
+	GpuProfilingFrameStats           gpuProfilingLastCompleted{};
+	uint64_t                         gpuProfilingSamplesCollected = 0;
+	float                            gpuProfilingLastFrameMs      = 0.0f;
+	float                            gpuProfilingLastFrameBudgetMs = 16.67f;
+	bool                             gpuProfilingLastFrameValid   = false;
+
+	bool                     enableCascadedShadowMaps = true;
+	float                    csmSplitLambda = 0.6f;
+	float                    csmTransitionBlendFraction = 0.12f;
+	uint32_t                 csmShadowMapResolution = 2048u;
+
+	struct CascadedShadowMap
+	{
+		vk::raii::Image                         image = nullptr;
+		std::unique_ptr<MemoryPool::Allocation> allocation = nullptr;
+		vk::raii::ImageView                     view = nullptr;
+		vk::raii::Sampler                       sampler = nullptr;
+		vk::ImageLayout                         currentLayout = vk::ImageLayout::eUndefined;
+	};
+	std::array<CascadedShadowMap, CSM_CASCADE_COUNT> csmShadowMaps;
+	std::array<glm::mat4, CSM_CASCADE_COUNT>         csmCascadeLightSpaceMatrices{glm::mat4(1.0f), glm::mat4(1.0f), glm::mat4(1.0f)};
+	std::array<float, CSM_CASCADE_COUNT>             csmCascadeSplitDepths{0.0f, 0.0f, 0.0f};
+	glm::vec4                                         csmTransitionData{0.0f};
+	bool                                              csmDataValid = false;
+	bool                                              csmResourcesDirty = true;
+	uint32_t                                          csmResourceExtentWidth = 0;
+	uint32_t                                          csmResourceExtentHeight = 0;
+
 	bool                enableFrustumCulling    = true;
+	bool                enableOcclusionCulling  = true;
+	bool                enableIndirectDrawCommands = true;
 	uint32_t            lastCullingVisibleCount = 0;
 	uint32_t            lastCullingCulledCount  = 0;
+	uint32_t            lastGpuFrustumInputCount   = 0;
+	uint32_t            lastGpuFrustumVisibleCount = 0;
 	// Distance-based LOD (projected-size skip in pixels)
 	bool  enableDistanceLOD            = true;
 	float lodPixelThresholdOpaque      = 1.5f;
@@ -1816,16 +2192,40 @@ class Renderer
 	bool createLightingPipeline();
 	bool createDepthPrepassPipeline();
 	bool createForwardPlusPipelinesAndResources();
+	bool createDeferredPipelineInfrastructure();
+	void destroyDeferredPipelineInfrastructure();
+	bool createDepthPyramidPipeline();
+	bool createSAOPipeline();
+	bool createVolumetricPipeline();
+	bool createFrustumCullPipeline();
+	bool createOcclusionCullPipeline();
 
 	// Ray query pipeline creation
 	bool createRayQueryDescriptorSetLayout();
 	bool createRayQueryPipeline();
 	bool createRayQueryResources();
+	bool createDepthPyramidResources();
+	void destroyDepthPyramidResources();
+	bool createCascadedShadowResources();
+	void destroyCascadedShadowResources();
+	void updateCascadedShadowData(const std::vector<ExtractedLight> &lights, CameraComponent *camera);
+	bool createOrResizeFrustumCullBuffers(uint32_t instanceCapacity, bool updateOnlyCurrentFrame = false);
+	void updateFrustumCullParams(uint32_t frameIndex, const glm::mat4 &vp, uint32_t instanceCount);
+	void dispatchFrustumCull(vk::raii::CommandBuffer &cmd, uint32_t instanceCount);
 	// If updateOnlyCurrentFrame is true, only descriptor sets for currentFrame will be updated.
 	// Use updateOnlyCurrentFrame=false during initialization/swapchain recreation when the device is idle.
 	bool createOrResizeForwardPlusBuffers(uint32_t tilesX, uint32_t tilesY, uint32_t slicesZ, bool updateOnlyCurrentFrame = false);
 	void updateForwardPlusParams(uint32_t frameIndex, const glm::mat4 &view, const glm::mat4 &proj, uint32_t lightCount, uint32_t tilesX, uint32_t tilesY, uint32_t slicesZ, float nearZ, float farZ);
 	void dispatchForwardPlus(vk::raii::CommandBuffer &cmd, uint32_t tilesX, uint32_t tilesY, uint32_t slicesZ);
+	void initializeGpuProfiling();
+	void teardownGpuProfiling();
+	bool isGpuProfilingActive() const;
+	void resetGpuProfilingQueries(vk::raii::CommandBuffer &cmd, uint32_t frameIndex);
+	void writeGpuProfileTimestamp(vk::raii::CommandBuffer &cmd, GpuProfilePass pass, bool beginMarker);
+	void resolveGpuProfilingFrame(uint32_t frameIndex);
+	void dispatchDepthPyramid(vk::raii::CommandBuffer &cmd);
+	void dispatchSAO(vk::raii::CommandBuffer &cmd);
+	void dispatchVolumetric(vk::raii::CommandBuffer &cmd);
 	// Ensure Forward+ compute descriptor set binding 0 (lights SSBO) is bound for a frame
 	void refreshForwardPlusComputeLightsBindingForFrame(uint32_t frameIndex);
 	bool createComputeResources();
@@ -1922,6 +2322,20 @@ class Renderer
 
 	std::pair<vk::raii::Buffer, vk::raii::DeviceMemory>                  createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties);
 	bool                                                                 createOpaqueSceneColorResources();
+	bool                                                                 createDeferredResources();
+	void                                                                 destroyDeferredResources();
+	bool                                                                 createGBufferResources();
+	void                                                                 destroyGBufferResources();
+	bool                                                                 createDeferredLightingResources();
+	void                                                                 destroyDeferredLightingResources();
+	bool                                                                 createDeferredLightingDescriptorSets();
+	bool                                                                 createTAAHistoryResources();
+	void                                                                 destroyTAAHistoryResources();
+	bool                                                                 createSAOResources();
+	void                                                                 destroySAOResources();
+	bool                                                                 createVolumetricResources();
+	void                                                                 destroyVolumetricResources();
+	void                                                                 updateTAAJitterState();
 	void                                                                 createTransparentDescriptorSets();
 	void                                                                 createTransparentFallbackDescriptorSets();
 	std::pair<vk::raii::Buffer, std::unique_ptr<MemoryPool::Allocation>> createBufferPooled(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties);

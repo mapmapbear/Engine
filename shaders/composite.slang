@@ -38,14 +38,24 @@ struct VSOut {
     return o;
 }
 
-// Set 0, binding 0: combined image sampler for the off-screen scene color
 [[vk::binding(0, 0)]] Sampler2D sceneColor;
+[[vk::binding(1, 0)]] Sampler2D taaHistoryColor;
+[[vk::binding(2, 0)]] Sampler2D saoTexture;
+[[vk::binding(3, 0)]] Sampler2D volumetricTexture;
 
 struct Push {
     float exposure;
     float gamma;
-    int   outputIsSRGB; // 1 when the color attachment is SRGB; 0 otherwise
-    float _pad;         // pad to 16 bytes for push constant layout
+    int   outputIsSRGB;
+    int   enableTAA;
+    int   taaHistoryValid;
+    int   enableSAO;
+    int   saoValid;
+    int   enableVolumetric;
+    int   volumetricValid;
+    float taaFeedback;
+    float _pad0;
+    float _pad1;
 };
 [[vk::push_constant]] Push pushConsts;
 
@@ -54,6 +64,23 @@ struct Push {
 {
     float4 c = sceneColor.Sample(i.UV);
     float3 color = c.rgb;
+
+    if (pushConsts.enableTAA != 0 && pushConsts.taaHistoryValid != 0)
+    {
+        float3 history = taaHistoryColor.Sample(i.UV).rgb;
+        color = lerp(color, history, saturate(pushConsts.taaFeedback));
+    }
+
+    if (pushConsts.enableSAO != 0 && pushConsts.saoValid != 0)
+    {
+        float ao = saoTexture.Sample(i.UV).r;
+        color *= saturate(ao);
+    }
+
+    if (pushConsts.enableVolumetric != 0 && pushConsts.volumetricValid != 0)
+    {
+        color += max(volumetricTexture.Sample(i.UV).rgb, 0.0);
+    }
 
     // Apply exposure and filmic tonemapping
     color *= pushConsts.exposure;

@@ -205,8 +205,9 @@ void ImGuiSystem::NewFrame()
 				ImGui::EndGroup();
 				ImGui::PopStyleVar();
 			}
-			ImGui::End();
-			return;
+		ImGui::End();
+		ImGui::EndFrame(); // End the frame properly before returning
+		return;
 		}
 	}
 
@@ -346,6 +347,62 @@ void ImGuiSystem::NewFrame()
 	else
 	{
 		ImGui::Text("Camera: Manual control (WASD + mouse)");
+	}
+
+	if (renderer)
+	{
+		ImGui::Separator();
+		ImGui::Text("Rendering Effects:");
+
+		const RenderMode currentMode = renderer->GetRenderMode();
+		const bool deferredModeActive = (currentMode == RenderMode::Deferred);
+		if (!deferredModeActive)
+		{
+			const char *modeName = (currentMode == RenderMode::RayQuery) ? "Ray Query" : "Rasterization";
+			ImGui::TextDisabled("Deferred-only effects are inactive in %s mode.", modeName);
+		}
+
+		if (deferredModeActive)
+		{
+			bool taaEnabled = renderer->IsTAAEnabled();
+			if (ImGui::Checkbox("TAA", &taaEnabled))
+			{
+				renderer->SetTAAEnabled(taaEnabled);
+			}
+
+			bool saoEnabled = renderer->IsSAOEnabled();
+			if (ImGui::Checkbox("SAO", &saoEnabled))
+			{
+				renderer->SetSAOEnabled(saoEnabled);
+			}
+
+			bool volumetricEnabled = renderer->IsVolumetricScatteringEnabled();
+			if (ImGui::Checkbox("Volumetric Scattering", &volumetricEnabled))
+			{
+				renderer->SetVolumetricScatteringEnabled(volumetricEnabled);
+			}
+
+			bool csmEnabled = renderer->IsCascadedShadowMapsEnabled();
+			if (ImGui::Checkbox("Cascaded Shadow Maps", &csmEnabled))
+			{
+				renderer->SetCascadedShadowMapsEnabled(csmEnabled);
+			}
+
+			if (csmEnabled)
+			{
+				float splitLambda = renderer->GetCSMSplitLambda();
+				if (ImGui::SliderFloat("CSM Split Lambda", &splitLambda, 0.0f, 1.0f, "%.2f"))
+				{
+					renderer->SetCSMSplitLambda(splitLambda);
+				}
+
+				float blendFraction = renderer->GetCSMTransitionBlendFraction();
+				if (ImGui::SliderFloat("CSM Blend Fraction", &blendFraction, 0.01f, 0.49f, "%.2f"))
+				{
+					renderer->SetCSMTransitionBlendFraction(blendFraction);
+				}
+			}
+		}
 	}
 
 	// Texture loading progress

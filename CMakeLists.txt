@@ -87,7 +87,7 @@ endif()
 # Shader compilation
 # Find Slang shaders (exclude utility modules that are imported, not compiled standalone)
 file(GLOB SLANG_SHADER_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.slang)
-list(FILTER SLANG_SHADER_SOURCES EXCLUDE REGEX ".*/(common_types|pbr_utils|lighting_utils|tonemapping_utils|hrtf)\\.slang$")
+list(FILTER SLANG_SHADER_SOURCES EXCLUDE REGEX ".*/(common_types|pbr_utils|lighting_utils|tonemapping_utils|shadow_utils|hrtf)\\.slang$")
 
 # Find slangc executable (optional)
 find_program(SLANGC_EXECUTABLE slangc HINTS $ENV{VULKAN_SDK}/bin)
@@ -114,14 +114,14 @@ if(SLANGC_EXECUTABLE)
 else()
     message(STATUS "slangc not found. Skipping shader compilation step.")
     add_custom_target(shaders)
-endif()
+endif() 
 
 # Source files
 # NOTE: Android builds include this project via `add_subdirectory(...)` from
 # `android/app/src/main/cpp/CMakeLists.txt`, so we must not require a desktop `main()`.
 set(SOURCES_COMMON
     engine.cpp
-    scene_loading.cpp
+    scene_loading.cpp         
     platform.cpp
     renderer_core.cpp
     renderer_rendering.cpp
@@ -147,7 +147,7 @@ set(SOURCES_COMMON
     pipeline.cpp
     descriptor_manager.cpp
     renderdoc_debug_system.cpp
-    mikktspace.c
+    mikktspace.c 
 )
 
 set(SOURCES_DESKTOP

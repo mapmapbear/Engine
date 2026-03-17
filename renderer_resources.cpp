@@ -1308,6 +1308,7 @@ bool Renderer::createDescriptorSets(Entity* entity, EntityResources& res, const 
         // Build descriptor writes dynamically to avoid writing unused bindings
         std::vector<vk::WriteDescriptorSet> descriptorWrites;
         std::array<vk::DescriptorImageInfo, 5> imageInfos;
+        std::array<vk::DescriptorImageInfo, CSM_CASCADE_COUNT> csmInfos;
         // Keep additional descriptor infos alive until updateDescriptorSets completes.
         vk::DescriptorImageInfo reflInfo;
         vk::WriteDescriptorSetAccelerationStructureKHR tlasInfo{};
@@ -1404,6 +1405,27 @@ bool Renderer::createDescriptorSets(Entity* entity, EntityResources& res, const 
           .descriptorCount = 1,
           .descriptorType = vk::DescriptorType::eCombinedImageSampler,
           .pImageInfo = &reflInfo
+        });
+
+        for (uint32_t cascadeIndex = 0; cascadeIndex < CSM_CASCADE_COUNT; ++cascadeIndex) {
+          vk::Sampler cascadeSampler = *defaultTextureResources.textureSampler;
+          vk::ImageView cascadeView = *defaultTextureResources.textureImageView;
+          if (enableCascadedShadowMaps && !!*csmShadowMaps[cascadeIndex].sampler && !!*csmShadowMaps[cascadeIndex].view) {
+            cascadeSampler = *csmShadowMaps[cascadeIndex].sampler;
+            cascadeView = *csmShadowMaps[cascadeIndex].view;
+          }
+          csmInfos[cascadeIndex] = vk::DescriptorImageInfo{
+            .sampler = cascadeSampler,
+            .imageView = cascadeView,
+            .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+          };
+        }
+        descriptorWrites.push_back({
+          .dstSet = *targetDescriptorSets[i],
+          .dstBinding = 14,
+          .descriptorCount = CSM_CASCADE_COUNT,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = csmInfos.data()
         });
 
         // Binding 11: TLAS (ray-query shadows in raster fragment shader)
@@ -2102,27 +2124,94 @@ void Renderer::createTransparentDescriptorSets() {
 
   // Update each descriptor set to point to the per-frame off-screen opaque color image
   for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-    vk::DescriptorImageInfo imageInfo{
-      .sampler = *opaqueSceneColorSampler,
-      .imageView = *opaqueSceneColorImageViews[i],
+    const uint32_t historyReadIndex = static_cast<uint32_t>((i + MAX_FRAMES_IN_FLIGHT - 1) % MAX_FRAMES_IN_FLIGHT);
+
+    vk::Sampler sceneSampler = *opaqueSceneColorSampler;
+    vk::ImageView sceneView = *opaqueSceneColorImageViews[i];
+
+    vk::Sampler taaSampler = *opaqueSceneColorSampler;
+    vk::ImageView taaView = *opaqueSceneColorImageViews[i];
+    if (!taaHistoryImageViews.empty() && historyReadIndex < taaHistoryImageViews.size() && *taaHistoryImageViews[historyReadIndex] != nullptr) {
+      taaView = *taaHistoryImageViews[historyReadIndex];
+      if (*taaHistorySampler != nullptr) {
+        taaSampler = *taaHistorySampler;
+      }
+    }
+
+    vk::Sampler saoTexSampler = sceneSampler;
+    vk::ImageView saoTexView = sceneView;
+    if (!saoImageViews.empty() && i < saoImageViews.size() && *saoImageViews[i] != nullptr) {
+      saoTexView = *saoImageViews[i];
+      if (*saoSampler != nullptr) {
+        saoTexSampler = *saoSampler;
+      }
+    }
+
+    vk::Sampler volumetricTexSampler = sceneSampler;
+    vk::ImageView volumetricTexView = sceneView;
+    if (!volumetricImageViews.empty() && i < volumetricImageViews.size() && *volumetricImageViews[i] != nullptr) {
+      volumetricTexView = *volumetricImageViews[i];
+      if (*volumetricSampler != nullptr) {
+        volumetricTexSampler = *volumetricSampler;
+      }
+    }
+
+    vk::DescriptorImageInfo sceneInfo{
+      .sampler = sceneSampler,
+      .imageView = sceneView,
+      .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+    };
+    vk::DescriptorImageInfo taaInfo{
+      .sampler = taaSampler,
+      .imageView = taaView,
+      .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+    };
+    vk::DescriptorImageInfo saoInfo{
+      .sampler = saoTexSampler,
+      .imageView = saoTexView,
+      .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+    };
+    vk::DescriptorImageInfo volumetricInfo{
+      .sampler = volumetricTexSampler,
+      .imageView = volumetricTexView,
       .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
     };
 
-    vk::WriteDescriptorSet descriptorWrite{
+    std::array<vk::WriteDescriptorSet, 4> descriptorWrites = {
+      vk::WriteDescriptorSet{
       .dstSet = *transparentDescriptorSets[i],
-      .dstBinding = 0, // Binding 0 in Set 1
+      .dstBinding = 0,
       .descriptorCount = 1,
       .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-      .pImageInfo = &imageInfo
-    }; {
+      .pImageInfo = &sceneInfo},
+      vk::WriteDescriptorSet{
+      .dstSet = *transparentDescriptorSets[i],
+      .dstBinding = 1,
+      .descriptorCount = 1,
+      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+      .pImageInfo = &taaInfo},
+      vk::WriteDescriptorSet{
+      .dstSet = *transparentDescriptorSets[i],
+      .dstBinding = 2,
+      .descriptorCount = 1,
+      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+      .pImageInfo = &saoInfo},
+      vk::WriteDescriptorSet{
+      .dstSet = *transparentDescriptorSets[i],
+      .dstBinding = 3,
+      .descriptorCount = 1,
+      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+      .pImageInfo = &volumetricInfo}
+    };
+
+    {
       std::lock_guard<std::mutex> lk(descriptorMutex);
-      device.updateDescriptorSets(descriptorWrite, nullptr);
+      device.updateDescriptorSets(descriptorWrites, nullptr);
     }
   }
 }
 
 void Renderer::createTransparentFallbackDescriptorSets() {
-  // Allocate one descriptor set per frame in flight using the same layout (single combined image sampler at binding 0)
   std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, *transparentDescriptorSetLayout);
   vk::DescriptorSetAllocateInfo allocInfo{
     .descriptorPool = *descriptorPool,
@@ -2133,7 +2222,6 @@ void Renderer::createTransparentFallbackDescriptorSets() {
     transparentFallbackDescriptorSets = vk::raii::DescriptorSets(device, allocInfo);
   }
 
-  // Point each set to the default texture, which is guaranteed to be in SHADER_READ_ONLY_OPTIMAL when used in the opaque pass
   for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
     vk::DescriptorImageInfo imageInfo{
       .sampler = *defaultTextureResources.textureSampler,
@@ -2141,17 +2229,341 @@ void Renderer::createTransparentFallbackDescriptorSets() {
       .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
     };
 
-    vk::WriteDescriptorSet descriptorWrite{
-      .dstSet = *transparentFallbackDescriptorSets[i],
-      .dstBinding = 0,
-      .descriptorCount = 1,
-      .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-      .pImageInfo = &imageInfo
-    }; {
+    std::array<vk::WriteDescriptorSet, 4> descriptorWrites = {
+      vk::WriteDescriptorSet{.dstSet = *transparentFallbackDescriptorSets[i], .dstBinding = 0, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &imageInfo},
+      vk::WriteDescriptorSet{.dstSet = *transparentFallbackDescriptorSets[i], .dstBinding = 1, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &imageInfo},
+      vk::WriteDescriptorSet{.dstSet = *transparentFallbackDescriptorSets[i], .dstBinding = 2, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &imageInfo},
+      vk::WriteDescriptorSet{.dstSet = *transparentFallbackDescriptorSets[i], .dstBinding = 3, .descriptorCount = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &imageInfo}
+    };
+    {
       std::lock_guard<std::mutex> lk(descriptorMutex);
-      device.updateDescriptorSets(descriptorWrite, nullptr);
+      device.updateDescriptorSets(descriptorWrites, nullptr);
     }
   }
+}
+
+void Renderer::destroyTAAHistoryResources() {
+  taaHistorySampler = vk::raii::Sampler(nullptr);
+  taaHistoryImages.clear();
+  taaHistoryImageAllocations.clear();
+  taaHistoryImageViews.clear();
+  taaHistoryImageLayouts.clear();
+  taaHistoryValid = false;
+  taaHistoryReadIndex = 0;
+  taaHistoryWriteIndex = 0;
+  taaFrameIndex = 0;
+  taaCurrentJitterPixels = glm::vec2(0.0f);
+  taaPreviousJitterPixels = glm::vec2(0.0f);
+  taaCurrentJitterNdc = glm::vec2(0.0f);
+  taaPreviousJitterNdc = glm::vec2(0.0f);
+}
+
+bool Renderer::createTAAHistoryResources() {
+  try {
+    destroyTAAHistoryResources();
+
+    taaHistoryImages.reserve(MAX_FRAMES_IN_FLIGHT);
+    taaHistoryImageAllocations.reserve(MAX_FRAMES_IN_FLIGHT);
+    taaHistoryImageViews.reserve(MAX_FRAMES_IN_FLIGHT);
+    taaHistoryImageLayouts.reserve(MAX_FRAMES_IN_FLIGHT);
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+      auto [image, allocation] = createImagePooled(
+        swapChainExtent.width,
+        swapChainExtent.height,
+        swapChainImageFormat,
+        vk::ImageTiling::eOptimal,
+        vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+        vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+      taaHistoryImages.push_back(std::move(image));
+      taaHistoryImageAllocations.push_back(std::move(allocation));
+      taaHistoryImageViews.push_back(createImageView(taaHistoryImages.back(), swapChainImageFormat, vk::ImageAspectFlagBits::eColor));
+
+      transitionImageLayout(*taaHistoryImages.back(), swapChainImageFormat, vk::ImageLayout::eUndefined, vk::ImageLayout::eShaderReadOnlyOptimal);
+      taaHistoryImageLayouts.push_back(vk::ImageLayout::eShaderReadOnlyOptimal);
+    }
+
+    vk::SamplerCreateInfo samplerInfo{
+      .magFilter = vk::Filter::eLinear,
+      .minFilter = vk::Filter::eLinear,
+      .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+      .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+      .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+    };
+    taaHistorySampler = vk::raii::Sampler(device, samplerInfo);
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create TAA history resources: " << e.what() << std::endl;
+    destroyTAAHistoryResources();
+    return false;
+  }
+}
+
+void Renderer::destroyGBufferResources() {
+  gBufferAlbedoImages.clear();
+  gBufferAlbedoImageAllocations.clear();
+  gBufferAlbedoImageViews.clear();
+  gBufferAlbedoImageLayouts.clear();
+
+  gBufferNormalImages.clear();
+  gBufferNormalImageAllocations.clear();
+  gBufferNormalImageViews.clear();
+  gBufferNormalImageLayouts.clear();
+
+  gBufferMaterialImages.clear();
+  gBufferMaterialImageAllocations.clear();
+  gBufferMaterialImageViews.clear();
+  gBufferMaterialImageLayouts.clear();
+
+  gBufferEmissiveImages.clear();
+  gBufferEmissiveImageAllocations.clear();
+  gBufferEmissiveImageViews.clear();
+  gBufferEmissiveImageLayouts.clear();
+}
+
+bool Renderer::createGBufferResources() {
+  try {
+    destroyGBufferResources();
+
+    auto createAttachment = [&](vk::Format format,
+                                std::vector<vk::raii::Image>& images,
+                                std::vector<std::unique_ptr<MemoryPool::Allocation>>& allocations,
+                                std::vector<vk::raii::ImageView>& views,
+                                std::vector<vk::ImageLayout>& layouts) {
+      images.reserve(MAX_FRAMES_IN_FLIGHT);
+      allocations.reserve(MAX_FRAMES_IN_FLIGHT);
+      views.reserve(MAX_FRAMES_IN_FLIGHT);
+      layouts.reserve(MAX_FRAMES_IN_FLIGHT);
+
+      for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+        auto [image, allocation] = createImagePooled(
+          swapChainExtent.width,
+          swapChainExtent.height,
+          format,
+          vk::ImageTiling::eOptimal,
+          vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+          vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+        images.push_back(std::move(image));
+        allocations.push_back(std::move(allocation));
+        views.push_back(createImageView(images.back(), format, vk::ImageAspectFlagBits::eColor));
+        layouts.push_back(vk::ImageLayout::eUndefined);
+      }
+    };
+
+    createAttachment(gBufferAlbedoFormat, gBufferAlbedoImages, gBufferAlbedoImageAllocations, gBufferAlbedoImageViews, gBufferAlbedoImageLayouts);
+    createAttachment(gBufferNormalFormat, gBufferNormalImages, gBufferNormalImageAllocations, gBufferNormalImageViews, gBufferNormalImageLayouts);
+    createAttachment(gBufferMaterialFormat, gBufferMaterialImages, gBufferMaterialImageAllocations, gBufferMaterialImageViews, gBufferMaterialImageLayouts);
+    createAttachment(gBufferEmissiveFormat, gBufferEmissiveImages, gBufferEmissiveImageAllocations, gBufferEmissiveImageViews, gBufferEmissiveImageLayouts);
+
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create G-buffer resources: " << e.what() << std::endl;
+    destroyGBufferResources();
+    return false;
+  }
+}
+
+void Renderer::destroyDeferredLightingResources() {
+  deferredLightingSampler = vk::raii::Sampler(nullptr);
+  deferredLightingImages.clear();
+  deferredLightingImageAllocations.clear();
+  deferredLightingImageViews.clear();
+  deferredLightingImageLayouts.clear();
+}
+
+bool Renderer::createDeferredLightingResources() {
+  try {
+    destroyDeferredLightingResources();
+
+    deferredLightingImages.reserve(MAX_FRAMES_IN_FLIGHT);
+    deferredLightingImageAllocations.reserve(MAX_FRAMES_IN_FLIGHT);
+    deferredLightingImageViews.reserve(MAX_FRAMES_IN_FLIGHT);
+    deferredLightingImageLayouts.reserve(MAX_FRAMES_IN_FLIGHT);
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+      auto [image, allocation] = createImagePooled(
+        swapChainExtent.width,
+        swapChainExtent.height,
+        deferredLightingFormat,
+        vk::ImageTiling::eOptimal,
+        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eColorAttachment,
+        vk::MemoryPropertyFlagBits::eDeviceLocal);
+
+      deferredLightingImages.push_back(std::move(image));
+      deferredLightingImageAllocations.push_back(std::move(allocation));
+      deferredLightingImageViews.push_back(createImageView(deferredLightingImages.back(), deferredLightingFormat, vk::ImageAspectFlagBits::eColor));
+      deferredLightingImageLayouts.push_back(vk::ImageLayout::eUndefined);
+    }
+
+    vk::SamplerCreateInfo samplerInfo{
+      .magFilter = vk::Filter::eLinear,
+      .minFilter = vk::Filter::eLinear,
+      .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+      .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+      .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+    };
+    deferredLightingSampler = vk::raii::Sampler(device, samplerInfo);
+
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create deferred lighting resources: " << e.what() << std::endl;
+    destroyDeferredLightingResources();
+    return false;
+  }
+}
+
+bool Renderer::createDeferredLightingDescriptorSets() {
+  try {
+    if (!*deferredLightingDescriptorSetLayout) {
+      return false;
+    }
+
+    deferredLightingDescriptorSets.clear();
+
+    std::vector<vk::DescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, *deferredLightingDescriptorSetLayout);
+    vk::DescriptorSetAllocateInfo allocInfo{
+      .descriptorPool = *descriptorPool,
+      .descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT),
+      .pSetLayouts = layouts.data()
+    };
+
+    {
+      std::lock_guard<std::mutex> lk(descriptorMutex);
+      deferredLightingDescriptorSets = vk::raii::DescriptorSets(device, allocInfo);
+    }
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+      vk::Sampler gbufferSampler = *deferredLightingSampler;
+      if (gbufferSampler == VK_NULL_HANDLE) {
+        gbufferSampler = *opaqueSceneColorSampler;
+      }
+
+      vk::DescriptorImageInfo albedoInfo{
+        .sampler = gbufferSampler,
+        .imageView = (i < gBufferAlbedoImageViews.size() && !!*gBufferAlbedoImageViews[i]) ? *gBufferAlbedoImageViews[i] : nullptr,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+      vk::DescriptorImageInfo normalInfo{
+        .sampler = gbufferSampler,
+        .imageView = (i < gBufferNormalImageViews.size() && !!*gBufferNormalImageViews[i]) ? *gBufferNormalImageViews[i] : nullptr,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+      vk::DescriptorImageInfo materialInfo{
+        .sampler = gbufferSampler,
+        .imageView = (i < gBufferMaterialImageViews.size() && !!*gBufferMaterialImageViews[i]) ? *gBufferMaterialImageViews[i] : nullptr,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+      vk::DescriptorImageInfo emissiveInfo{
+        .sampler = gbufferSampler,
+        .imageView = (i < gBufferEmissiveImageViews.size() && !!*gBufferEmissiveImageViews[i]) ? *gBufferEmissiveImageViews[i] : nullptr,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+
+      vk::DescriptorImageInfo depthInfo{
+        .sampler = gbufferSampler,
+        .imageView = *depthImageView,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
+      };
+
+      vk::DescriptorImageInfo lightingOutputInfo{
+        .sampler = nullptr,
+        .imageView = (i < deferredLightingImageViews.size() && !!*deferredLightingImageViews[i]) ? *deferredLightingImageViews[i] : nullptr,
+        .imageLayout = vk::ImageLayout::eGeneral
+      };
+
+      std::array<vk::WriteDescriptorSet, 6> descriptorWrites{};
+      uint32_t writeCount = 0;
+
+      if (albedoInfo.imageView) {
+        descriptorWrites[writeCount++] = vk::WriteDescriptorSet{
+          .dstSet = *deferredLightingDescriptorSets[i],
+          .dstBinding = 0,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &albedoInfo
+        };
+      }
+      if (normalInfo.imageView) {
+        descriptorWrites[writeCount++] = vk::WriteDescriptorSet{
+          .dstSet = *deferredLightingDescriptorSets[i],
+          .dstBinding = 1,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &normalInfo
+        };
+      }
+      if (materialInfo.imageView) {
+        descriptorWrites[writeCount++] = vk::WriteDescriptorSet{
+          .dstSet = *deferredLightingDescriptorSets[i],
+          .dstBinding = 2,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &materialInfo
+        };
+      }
+      if (emissiveInfo.imageView) {
+        descriptorWrites[writeCount++] = vk::WriteDescriptorSet{
+          .dstSet = *deferredLightingDescriptorSets[i],
+          .dstBinding = 3,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &emissiveInfo
+        };
+      }
+      if (depthInfo.imageView) {
+        descriptorWrites[writeCount++] = vk::WriteDescriptorSet{
+          .dstSet = *deferredLightingDescriptorSets[i],
+          .dstBinding = 4,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &depthInfo
+        };
+      }
+      if (lightingOutputInfo.imageView) {
+        descriptorWrites[writeCount++] = vk::WriteDescriptorSet{
+          .dstSet = *deferredLightingDescriptorSets[i],
+          .dstBinding = 5,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eStorageImage,
+          .pImageInfo = &lightingOutputInfo
+        };
+      }
+
+      if (writeCount > 0) {
+        std::lock_guard<std::mutex> lk(descriptorMutex);
+        device.updateDescriptorSets(descriptorWrites, nullptr);
+      }
+    }
+
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create deferred lighting descriptor sets: " << e.what() << std::endl;
+    deferredLightingDescriptorSets.clear();
+    return false;
+  }
+}
+
+void Renderer::destroyDeferredResources() {
+  destroyDeferredLightingResources();
+  destroyGBufferResources();
+}
+
+bool Renderer::createDeferredResources() {
+  if (!createGBufferResources()) {
+    destroyDeferredResources();
+    return false;
+  }
+  if (!createDeferredLightingResources()) {
+    destroyDeferredResources();
+    return false;
+  }
+  if (!createDeferredLightingDescriptorSets()) {
+    destroyDeferredResources();
+    return false;
+  }
+  return true;
 }
 
 bool Renderer::createOpaqueSceneColorResources() {
@@ -2191,6 +2603,11 @@ bool Renderer::createOpaqueSceneColorResources() {
       .addressModeW = vk::SamplerAddressMode::eClampToEdge,
     };
     opaqueSceneColorSampler = vk::raii::Sampler(device, samplerInfo);
+
+    if (!createDeferredResources()) {
+      std::cerr << "Warning: Failed to create deferred path resources" << std::endl;
+    }
+
     return true;
   } catch (const std::exception& e) {
     std::cerr << "Failed to create opaque scene color resources: " << e.what() << std::endl;

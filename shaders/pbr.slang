@@ -19,6 +19,7 @@ import common_types;
 import pbr_utils;
 import lighting_utils;
 import tonemapping_utils;
+import shadow_utils;
 
 // Input from vertex buffer
 struct VSInput {
@@ -68,10 +69,12 @@ struct VSOutput {
 // Ray-query shared buffers (used for material-aware raster shadow queries)
 [[vk::binding(12, 0)]] StructuredBuffer<GeometryInfo> geometryInfoBuffer;
 [[vk::binding(13, 0)]] StructuredBuffer<MaterialData> materialBuffer;
+[[vk::binding(14, 0)]] Sampler2D cascadeShadowMaps[CSM_CASCADE_COUNT];
 
 [[vk::push_constant]] PushConstants material;
 
 static const float RASTER_SHADOW_EPS = 0.001;
+static const uint CSM_DEFAULT_PCF_KERNEL_SIZE = 2u;
 
 // Hard shadow query for raster fragment shading.
 // NOTE: We intentionally treat NON_OPAQUE candidates as non-occluding here.
@@ -289,10 +292,15 @@ float4 PSMain(VSOutput input) : SV_TARGET
                 // and casting per-light shadows drops FPS drastically. Shadow only the directional
                 // light (sun) for now.
                 if (ubo.padding2 != 0.0 && light.lightType == 1) {
-                    float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
-                    float3 shadowOrigin = input.WorldPos + N * RASTER_SHADOW_EPS;
-                    bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
-                    visibility = occluded ? 0.0 : 1.0;
+                    float csmVisibility = sampleDirectionalCSMVisibility(input.WorldPos, N, L, dVS);
+                    if (csmVisibility >= 0.0) {
+                        visibility = csmVisibility;
+                    } else {
+                        float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
+                        float3 shadowOrigin = input.WorldPos + N * RASTER_SHADOW_EPS;
+                        bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
+                        visibility = occluded ? 0.0 : 1.0;
+                    }
                 }
 
                 float3 H = normalize(V + L);
@@ -357,10 +365,15 @@ float4 PSMain(VSOutput input) : SV_TARGET
             if (NdotL > 0.0) {
                 float visibility = 1.0;
                 if (ubo.padding2 != 0.0 && light.lightType == 1) {
-                    float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
-                    float3 shadowOrigin = input.WorldPos + N * RASTER_SHADOW_EPS;
-                    bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
-                    visibility = occluded ? 0.0 : 1.0;
+                    float csmVisibility = sampleDirectionalCSMVisibility(input.WorldPos, N, L, dVS);
+                    if (csmVisibility >= 0.0) {
+                        visibility = csmVisibility;
+                    } else {
+                        float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
+                        float3 shadowOrigin = input.WorldPos + N * RASTER_SHADOW_EPS;
+                        bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
+                        visibility = occluded ? 0.0 : 1.0;
+                    }
                 }
 
                 float3 H = normalize(V + L);
@@ -550,6 +563,7 @@ float4 GlassPSMain(VSOutput input) : SV_TARGET
         if (count > 0u) {
             float3 Ng = normalize(input.GeometricNormal);
             float3 Vv = normalize(ubo.camPos.xyz - input.WorldPos);
+            float dVS = abs(mul(ubo.view, float4(input.WorldPos, 1.0)).z);
             // Use a neutral albedo to avoid darkening glass; weight specular more
             float3 alb = float3(0.6, 0.6, 0.6);
             float  rough = 0.49;
@@ -580,10 +594,19 @@ float4 GlassPSMain(VSOutput input) : SV_TARGET
                 if (NdotL > 0.0) {
                     float visibility = 1.0;
                     if (ubo.padding2 != 0.0) {
-                        float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
-                        float3 shadowOrigin = input.WorldPos + Ng * RASTER_SHADOW_EPS;
-                        bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
-                        visibility = occluded ? 0.0 : 1.0;
+                        float csmVisibility = -1.0;
+                        if (light.lightType == 1) {
+                            csmVisibility = sampleDirectionalCSMVisibility(input.WorldPos, Ng, L, dVS);
+                        }
+
+                        if (csmVisibility >= 0.0) {
+                            visibility = csmVisibility;
+                        } else {
+                            float tMaxShadow = (light.lightType == 1) ? 10000.0 : max(distToLight - RASTER_SHADOW_EPS, RASTER_SHADOW_EPS);
+                            float3 shadowOrigin = input.WorldPos + Ng * RASTER_SHADOW_EPS;
+                            bool occluded = traceShadowOccluded(shadowOrigin, L, RASTER_SHADOW_EPS, tMaxShadow);
+                            visibility = occluded ? 0.0 : 1.0;
+                        }
                     }
 
                     float3 H = normalize(Vv + L);
@@ -620,4 +643,55 @@ float4 GlassPSMain(VSOutput input) : SV_TARGET
     }
 
     return float4(color, alphaOut);
+}
+
+float sampleShadowMapPCFReady(Sampler2D shadowMap, float2 uv, float receiverDepth, float bias)
+{
+    if (CSM_DEFAULT_PCF_KERNEL_SIZE <= 1u) {
+        return shadowDepthCompare(shadowMap, uv, receiverDepth, bias);
+    }
+
+    uint shadowWidth = 1u;
+    uint shadowHeight = 1u;
+    shadowMap.GetDimensions(shadowWidth, shadowHeight);
+
+    float2 texelSize = float2(
+        1.0 / max(float(shadowWidth), 1.0),
+        1.0 / max(float(shadowHeight), 1.0));
+
+    return sampleShadowMapPCF(
+        shadowMap,
+        uv,
+        receiverDepth,
+        bias,
+        texelSize,
+        CSM_DEFAULT_PCF_KERNEL_SIZE);
+}
+
+float sampleCascadeVisibility(uint cascadeIndex, float3 worldPos, float bias)
+{
+    float4 shadowClip = mul(ubo.cascadeLightSpaceMatrices[cascadeIndex], float4(worldPos, 1.0));
+    float invW = 1.0 / max(abs(shadowClip.w), 1e-5);
+    float3 shadowNdc = shadowClip.xyz * invW;
+    float2 uv = shadowNdc.xy * 0.5 + 0.5;
+    float receiverDepth = shadowNdc.z;
+    return sampleShadowMapPCFReady(cascadeShadowMaps[cascadeIndex], uv, receiverDepth, bias);
+}
+
+float sampleDirectionalCSMVisibility(float3 worldPos, float3 N, float3 L, float viewDepth)
+{
+    if (ubo.cascadeTransitionData.x <= 0.0 || ubo.cascadeSplitDepths.z <= 0.0) {
+        return -1.0;
+    }
+
+    CascadeBlendSelection selection = selectCascadeByDepth(viewDepth, ubo.cascadeSplitDepths, ubo.cascadeTransitionData);
+    float bias = computeCascadeShadowBias(N, L, RASTER_SHADOW_EPS * 4.0);
+    float visibility0 = sampleCascadeVisibility(selection.cascadeIndex, worldPos, bias);
+
+    if (selection.blendWeight > 0.0 && selection.nextCascadeIndex != selection.cascadeIndex) {
+        float visibility1 = sampleCascadeVisibility(selection.nextCascadeIndex, worldPos, bias);
+        return lerp(visibility0, visibility1, selection.blendWeight);
+    }
+
+    return visibility0;
 }

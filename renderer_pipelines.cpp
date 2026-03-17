@@ -188,17 +188,25 @@ bool Renderer::createPBRDescriptorSetLayout() {
         .descriptorCount = 1,
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .pImmutableSamplers = nullptr
+      },
+      vk::DescriptorSetLayoutBinding{
+        .binding = 14,
+        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+        .descriptorCount = CSM_CASCADE_COUNT,
+        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        .pImmutableSamplers = nullptr
       }
     };
 
     // Create a descriptor set layout
     // Descriptor indexing: set per-binding flags for UPDATE_AFTER_BIND on UBO (0) and sampled images (1..5)
     vk::DescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo{};
-    std::array<vk::DescriptorBindingFlags, 14> bindingFlags{};
+    std::array<vk::DescriptorBindingFlags, 15> bindingFlags{};
     if (descriptorIndexingEnabled) {
       bindingFlags[0] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlags[1] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlags[10] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+      bindingFlags[14] = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
       bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
       bindingFlagsInfo.pBindingFlags = bindingFlags.data();
     }
@@ -213,18 +221,24 @@ bool Renderer::createPBRDescriptorSetLayout() {
 
     pbrDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, layoutInfo);
 
-    // Binding 7: transparent passes input
-    // Layout for Set 1: Just the scene color texture
-    vk::DescriptorSetLayoutBinding sceneColorBinding{
-      .binding = 0, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment
+    std::array<vk::DescriptorSetLayoutBinding, 4> transparentBindings = {
+      vk::DescriptorSetLayoutBinding{.binding = 0, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+      vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+      vk::DescriptorSetLayoutBinding{.binding = 2, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+      vk::DescriptorSetLayoutBinding{.binding = 3, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment}
     };
-    vk::DescriptorSetLayoutCreateInfo transparentLayoutInfo{.bindingCount = 1, .pBindings = &sceneColorBinding};
+    vk::DescriptorSetLayoutCreateInfo transparentLayoutInfo{.bindingCount = static_cast<uint32_t>(transparentBindings.size()), .pBindings = transparentBindings.data()};
     if (descriptorIndexingEnabled) {
       // Make this sampler binding update-after-bind safe as well (optional)
       vk::DescriptorSetLayoutBindingFlagsCreateInfo transBindingFlagsInfo{};
-      vk::DescriptorBindingFlags transFlags = vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
-      transBindingFlagsInfo.bindingCount = 1;
-      transBindingFlagsInfo.pBindingFlags = &transFlags;
+      std::array<vk::DescriptorBindingFlags, 4> transFlags = {
+        vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending,
+        vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending,
+        vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending,
+        vk::DescriptorBindingFlagBits::eUpdateAfterBind | vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending
+      };
+      transBindingFlagsInfo.bindingCount = static_cast<uint32_t>(transFlags.size());
+      transBindingFlagsInfo.pBindingFlags = transFlags.data();
       transparentLayoutInfo.flags |= vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool;
       transparentLayoutInfo.pNext = &transBindingFlagsInfo;
 
@@ -240,6 +254,62 @@ bool Renderer::createPBRDescriptorSetLayout() {
     std::cerr << "Failed to create PBR descriptor set layout: " << e.what() << std::endl;
     return false;
   }
+}
+
+bool Renderer::createDeferredPipelineInfrastructure() {
+  try {
+    if (!*deferredGBufferDescriptorSetLayout) {
+      std::array gbufferBindings = {
+        vk::DescriptorSetLayoutBinding{.binding = 0, .descriptorType = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment},
+        vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+        vk::DescriptorSetLayoutBinding{.binding = 2, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+        vk::DescriptorSetLayoutBinding{.binding = 3, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+        vk::DescriptorSetLayoutBinding{.binding = 4, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment},
+        vk::DescriptorSetLayoutBinding{.binding = 5, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment}
+      };
+      vk::DescriptorSetLayoutCreateInfo gbufferLayoutInfo{.bindingCount = static_cast<uint32_t>(gbufferBindings.size()), .pBindings = gbufferBindings.data()};
+      deferredGBufferDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, gbufferLayoutInfo);
+    }
+
+    if (!*deferredGBufferPipelineLayout) {
+      vk::PipelineLayoutCreateInfo gbufferPipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*deferredGBufferDescriptorSetLayout};
+      deferredGBufferPipelineLayout = vk::raii::PipelineLayout(device, gbufferPipelineLayoutInfo);
+    }
+
+    if (!*deferredLightingDescriptorSetLayout) {
+      std::array deferredLightingBindings = {
+        vk::DescriptorSetLayoutBinding{.binding = 0, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 1, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 2, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 3, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 4, .descriptorType = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        vk::DescriptorSetLayoutBinding{.binding = 5, .descriptorType = vk::DescriptorType::eStorageImage, .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute}
+      };
+      vk::DescriptorSetLayoutCreateInfo deferredLightingLayoutInfo{.bindingCount = static_cast<uint32_t>(deferredLightingBindings.size()), .pBindings = deferredLightingBindings.data()};
+      deferredLightingDescriptorSetLayout = vk::raii::DescriptorSetLayout(device, deferredLightingLayoutInfo);
+    }
+
+    if (!*deferredLightingPipelineLayout) {
+      vk::PipelineLayoutCreateInfo deferredLightingPipelineLayoutInfo{.setLayoutCount = 1, .pSetLayouts = &*deferredLightingDescriptorSetLayout};
+      deferredLightingPipelineLayout = vk::raii::PipelineLayout(device, deferredLightingPipelineLayoutInfo);
+    }
+
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "Failed to create deferred pipeline infrastructure: " << e.what() << std::endl;
+    destroyDeferredPipelineInfrastructure();
+    return false;
+  }
+}
+
+void Renderer::destroyDeferredPipelineInfrastructure() {
+  deferredLightingDescriptorSets.clear();
+  deferredGBufferPipeline = vk::raii::Pipeline(nullptr);
+  deferredLightingPipeline = vk::raii::Pipeline(nullptr);
+  deferredGBufferPipelineLayout = vk::raii::PipelineLayout(nullptr);
+  deferredLightingPipelineLayout = vk::raii::PipelineLayout(nullptr);
+  deferredGBufferDescriptorSetLayout = vk::raii::DescriptorSetLayout(nullptr);
+  deferredLightingDescriptorSetLayout = vk::raii::DescriptorSetLayout(nullptr);
 }
 
 // Create a graphics pipeline
@@ -796,9 +866,8 @@ bool Renderer::createCompositePipeline() {
     std::array dynStates = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
     vk::PipelineDynamicStateCreateInfo dynamicState{.dynamicStateCount = static_cast<uint32_t>(dynStates.size()), .pDynamicStates = dynStates.data()};
 
-    // Pipeline layout: single set (combined image sampler) + push constants for exposure/gamma/srgb flag
     vk::DescriptorSetLayout setLayouts[] = {*transparentDescriptorSetLayout};
-    vk::PushConstantRange pushRange{.stageFlags = vk::ShaderStageFlagBits::eFragment, .offset = 0, .size = 16}; // matches struct Push in composite.slang
+    vk::PushConstantRange pushRange{.stageFlags = vk::ShaderStageFlagBits::eFragment, .offset = 0, .size = sizeof(CompositePushConstants)};
     vk::PipelineLayoutCreateInfo plInfo{.setLayoutCount = 1, .pSetLayouts = setLayouts, .pushConstantRangeCount = 1, .pPushConstantRanges = &pushRange};
     compositePipelineLayout = vk::raii::PipelineLayout(device, plInfo);
 
@@ -1363,24 +1432,45 @@ bool Renderer::createRayQueryResources() {
         }
       }
 
-      // Update each set to sample the rayQueryOutputImage
       for (size_t i = 0; i < rqCompositeDescriptorSets.size(); ++i) {
         // Use a dedicated sampler to avoid null sampler issues during early init
         vk::Sampler samplerHandle = *rqCompositeSampler;
-        vk::DescriptorImageInfo imgInfo{
+        vk::DescriptorImageInfo sceneInfo{
           .sampler = samplerHandle,
           .imageView = *rayQueryOutputImageView,
           .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal
         };
-        vk::WriteDescriptorSet write{
+        std::array<vk::WriteDescriptorSet, 4> writes = {
+          vk::WriteDescriptorSet{
           .dstSet = *rqCompositeDescriptorSets[i],
           .dstBinding = 0,
           .dstArrayElement = 0,
           .descriptorCount = 1,
           .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-          .pImageInfo = &imgInfo
+          .pImageInfo = &sceneInfo},
+          vk::WriteDescriptorSet{
+          .dstSet = *rqCompositeDescriptorSets[i],
+          .dstBinding = 1,
+          .dstArrayElement = 0,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &sceneInfo},
+          vk::WriteDescriptorSet{
+          .dstSet = *rqCompositeDescriptorSets[i],
+          .dstBinding = 2,
+          .dstArrayElement = 0,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &sceneInfo},
+          vk::WriteDescriptorSet{
+          .dstSet = *rqCompositeDescriptorSets[i],
+          .dstBinding = 3,
+          .dstArrayElement = 0,
+          .descriptorCount = 1,
+          .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+          .pImageInfo = &sceneInfo}
         };
-        device.updateDescriptorSets({write}, {});
+        device.updateDescriptorSets(writes, {});
       }
     }
 

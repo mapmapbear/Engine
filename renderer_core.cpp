@@ -277,6 +277,11 @@ bool Renderer::Initialize(const std::string &appName, bool enableValidationLayer
 		return false;
 	}
 
+	if (!createDeferredPipelineInfrastructure())
+	{
+		std::cerr << "Warning: Failed to create deferred pipeline infrastructure" << std::endl;
+	}
+
 	// Create composite pipeline (fullscreen pass for off-screen → swapchain)
 	if (!createCompositePipeline())
 	{
@@ -336,6 +341,23 @@ bool Renderer::Initialize(const std::string &appName, bool enableValidationLayer
 
 	if (useForwardPlus)
 	{
+		if (!createDepthPyramidResources())
+		{
+			std::cerr << "Failed to create depth pyramid resources" << std::endl;
+			return false;
+		}
+		if (!createSAOResources())
+		{
+			std::cerr << "Warning: Failed to create SAO resources" << std::endl;
+		}
+		if (!createVolumetricResources())
+		{
+			std::cerr << "Warning: Failed to create volumetric resources" << std::endl;
+		}
+	}
+
+	if (useForwardPlus)
+	{
 		if (!createDepthPrepassPipeline())
 		{
 			std::cerr << "Failed to create depth prepass pipeline" << std::endl;
@@ -366,6 +388,11 @@ bool Renderer::Initialize(const std::string &appName, bool enableValidationLayer
 	{
 		std::cerr << "Failed to create opaque scene color resources" << std::endl;
 		return false;
+	}
+
+	if (!createTAAHistoryResources())
+	{
+		std::cerr << "Warning: Failed to create TAA history resources" << std::endl;
 	}
 
 	createTransparentDescriptorSets();
@@ -525,6 +552,7 @@ void Renderer::Cleanup()
 	transparentFallbackDescriptorSets.clear();
 	compositeDescriptorSets.clear();
 	rqCompositeDescriptorSets.clear();
+	deferredLightingDescriptorSets.clear();
 
 	// 3.5) Clear ray query descriptor sets BEFORE destroying descriptor pool
 	// Without this, rayQueryDescriptorSets' RAII destructor tries to free them after
@@ -534,6 +562,8 @@ void Renderer::Cleanup()
 	// Ray Query composite sampler/sets are allocated from the shared descriptor pool.
 	// Ensure they are released before destroying the pool.
 	rqCompositeSampler = nullptr;
+	depthPyramidSampler = nullptr;
+	saoSampler = nullptr;
 
 	// 4) Destroy/Reset pipelines and pipeline layouts (graphics/compute/forward+)
 	graphicsPipeline               = nullptr;
@@ -545,6 +575,9 @@ void Renderer::Cleanup()
 	lightingPipeline               = nullptr;
 	compositePipeline              = nullptr;
 	forwardPlusPipeline            = nullptr;
+	depthPyramidPipeline           = nullptr;
+	saoPipeline                    = nullptr;
+	volumetricPipeline             = nullptr;
 	depthPrepassPipeline           = nullptr;
 
 	pipelineLayout               = nullptr;
@@ -553,6 +586,10 @@ void Renderer::Cleanup()
 	compositePipelineLayout      = nullptr;
 	pbrTransparentPipelineLayout = nullptr;
 	forwardPlusPipelineLayout    = nullptr;
+	depthPyramidPipelineLayout   = nullptr;
+	saoPipelineLayout            = nullptr;
+	volumetricPipelineLayout     = nullptr;
+	destroyDeferredPipelineInfrastructure();
 
 	// 4.3) Ray query pipelines and layouts
 	rayQueryPipeline       = nullptr;
@@ -585,6 +622,9 @@ void Renderer::Cleanup()
 	transparentDescriptorSetLayout = nullptr;
 	compositeDescriptorSetLayout   = nullptr;
 	forwardPlusDescriptorSetLayout = nullptr;
+	depthPyramidDescriptorSetLayout = nullptr;
+	saoDescriptorSetLayout        = nullptr;
+	volumetricDescriptorSetLayout = nullptr;
 	rayQueryDescriptorSetLayout    = nullptr;
 
 	// Pools last, after sets are cleared
@@ -609,6 +649,9 @@ void Renderer::Cleanup()
 	opaqueSceneColorImageAllocations.clear();
 	opaqueSceneColorImageViews.clear();
 	opaqueSceneColorImageLayouts.clear();
+	destroyDeferredResources();
+	destroyTAAHistoryResources();
+	destroyVolumetricResources();
 
 	// 7.5) Ray query output image and acceleration structures
 	rayQueryOutputImageView       = nullptr;
